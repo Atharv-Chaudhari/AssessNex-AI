@@ -9,4 +9,3 @@ python-multipart
 validators
 python-dotenv
 streamlit-lottie
-streamlit-animated-progress
