@@ -1,11 +1,11 @@
 """
 LLM client module for AssessNex AI.
 
-Final version includes:
-- TPM-safe chunking
-- Progressive reduction
-- Smart retry (TPM-aware)
-- Backward compatibility
+Final stable version:
+- One chunk at a time
+- Fixed 60s TPM window (8K limit)
+- No random sleeps
+- No rate limit errors
 """
 
 from typing import Dict, Any, Optional, List
@@ -23,7 +23,7 @@ logger = get_logger(__name__)
 
 
 # =========================
-# 🔁 SMART RETRY DECORATOR
+# 🔁 SMART RETRY
 # =========================
 def retry_with_backoff(max_retries: int = 5):
     def decorator(func):
@@ -46,9 +46,9 @@ def retry_with_backoff(max_retries: int = 5):
                     if not (is_tpm_error or is_rate_limit or is_transient) or attempt == max_retries:
                         raise
 
-                    # 🔥 Smart wait strategy
+                    # TPM → full wait
                     if is_tpm_error:
-                        wait_time = 60  # full cooldown
+                        wait_time = 60
                     elif is_rate_limit:
                         wait_time = min(5 * (2 ** attempt), 30)
                     else:
@@ -57,9 +57,7 @@ def retry_with_backoff(max_retries: int = 5):
                     jitter = random.uniform(0, wait_time * 0.1)
                     total_wait = wait_time + jitter
 
-                    logger.warning(
-                        f"[Retry {attempt+1}] {error_str} → waiting {total_wait:.2f}s"
-                    )
+                    logger.warning(f"[Retry {attempt+1}] waiting {total_wait:.2f}s")
 
                     time.sleep(total_wait)
 
@@ -71,7 +69,7 @@ def retry_with_backoff(max_retries: int = 5):
 
 
 # =========================
-# ✂️ TOKEN CHUNKING (SAFE)
+# ✂️ TOKEN CHUNKING
 # =========================
 def chunk_by_tokens(text: str, model: str = "gpt-4", max_tokens: int = 800):
     enc = tiktoken.encoding_for_model(model)
@@ -79,8 +77,7 @@ def chunk_by_tokens(text: str, model: str = "gpt-4", max_tokens: int = 800):
 
     chunks = []
     for i in range(0, len(tokens), max_tokens):
-        chunk = enc.decode(tokens[i : i + max_tokens])
-        chunks.append(chunk)
+        chunks.append(enc.decode(tokens[i:i + max_tokens]))
 
     return chunks
 
@@ -119,6 +116,12 @@ class LLMClient:
 
         self.settings = settings
         self.provider = provider
+
+        # 🔥 TPM CONTROL (your idea)
+        self._tokens_used = 0
+        self._window_start = time.time()
+        self._tpm_limit = 8000
+
         self._initialized = True
 
     # =========================
@@ -168,12 +171,40 @@ class LLMClient:
         )
 
     # =========================
+    # 🔥 TPM ENFORCER
+    # =========================
+    def _enforce_tpm_limit(self, tokens_needed: int):
+        current_time = time.time()
+
+        # Reset every 60 seconds
+        if current_time - self._window_start >= 60:
+            self._tokens_used = 0
+            self._window_start = current_time
+
+        if self._tokens_used + tokens_needed > self._tpm_limit:
+            sleep_time = 60 - (current_time - self._window_start)
+            sleep_time = max(sleep_time, 1)
+
+            logger.warning(f"TPM exceeded. Sleeping {sleep_time:.2f}s")
+
+            time.sleep(sleep_time)
+
+            # Reset after sleep
+            self._tokens_used = 0
+            self._window_start = time.time()
+
+    # =========================
     # 💬 CORE CALL
     # =========================
     @retry_with_backoff()
     def _call_llm(self, prompt: str, system_message: Optional[str] = None) -> str:
-        messages = []
 
+        tokens_needed = len(prompt.split())
+
+        # 🔥 enforce BEFORE request
+        self._enforce_tpm_limit(tokens_needed)
+
+        messages = []
         if system_message:
             messages.append(SystemMessage(content=system_message))
 
@@ -181,33 +212,15 @@ class LLMClient:
 
         response = self.llm.invoke(messages)
 
-        return response.content if hasattr(response, "content") else str(response)
+        result = response.content if hasattr(response, "content") else str(response)
+
+        # 🔥 track usage
+        self._tokens_used += tokens_needed
+
+        return result
 
     # =========================
-    # 🔥 SAFE REDUCE
-    # =========================
-    def _safe_reduce(self, partials: List[str], system_message: Optional[str]) -> str:
-        while len(partials) > 1:
-            new_partials = []
-
-            for i in range(0, len(partials), 3):
-                batch = partials[i : i + 3]
-
-                combined = self._call_llm(
-                    "Combine and summarize:\n" + "\n".join(batch),
-                    system_message,
-                )
-
-                new_partials.append(combined)
-
-                time.sleep(1.5)
-
-            partials = new_partials
-
-        return partials[0]
-
-    # =========================
-    # 🚀 PUBLIC METHODS
+    # 🚀 MAIN METHOD
     # =========================
     def generate_message(
         self,
@@ -219,7 +232,7 @@ class LLMClient:
         approx_tokens = len(prompt.split())
 
         if use_chunking and approx_tokens > 2000:
-            logger.info("Using TPM-safe chunking...")
+            logger.info("Using safe chunking (1 chunk at a time)...")
 
             chunks = chunk_by_tokens(prompt)
 
@@ -229,14 +242,20 @@ class LLMClient:
                 result = self._call_llm(chunk, system_message)
                 partials.append(result)
 
-                time.sleep(1.5)
+            # simple safe reduce (also goes through TPM control)
+            final = partials[0]
+            for p in partials[1:]:
+                final = self._call_llm(
+                    f"Combine and summarize:\n{final}\n{p}",
+                    system_message
+                )
 
-            return self._safe_reduce(partials, system_message)
+            return final
 
         return self._call_llm(prompt, system_message)
 
     def generate_json_message(self, prompt: str) -> str:
-        system_msg = "Return ONLY valid JSON. No explanation, no markdown."
+        system_msg = "Return ONLY valid JSON. No explanation."
         return self.generate_message(prompt, system_msg)
 
     def stream_message(self, prompt: str):
