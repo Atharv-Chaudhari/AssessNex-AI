@@ -10,7 +10,8 @@ Supports:
 Includes:
 - Retry with exponential backoff
 - Token-based chunking
-- Map-Reduce summarization for large inputs
+- Map-Reduce summarization
+- Backward compatible create_completion()
 """
 
 from typing import Dict, Any, Optional, List
@@ -53,7 +54,6 @@ def retry_with_backoff(max_retries: int = 5, min_wait: float = 1, max_wait: floa
 
                     wait_time = min(min_wait * (2 ** attempt), max_wait)
                     jitter = random.uniform(0, wait_time * 0.1)
-
                     total_wait = wait_time + jitter
 
                     logger.warning(
@@ -167,7 +167,7 @@ class LLMClient:
         )
 
     # =========================
-    # 💬 CORE GENERATION
+    # 💬 INTERNAL CALL
     # =========================
     @retry_with_backoff()
     def _call_llm(self, prompt: str, system_message: Optional[str] = None) -> str:
@@ -191,31 +191,22 @@ class LLMClient:
         system_message: Optional[str] = None,
         use_chunking: bool = True,
     ) -> str:
-        """
-        Auto handles:
-        - Token overflow
-        - Rate limiting
-        """
 
-        # 🔹 Estimate tokens
         approx_tokens = len(prompt.split())
 
-        # 🔴 If too large → chunk
+        # 🔴 Large input → chunking
         if use_chunking and approx_tokens > 3000:
             logger.info("Using chunking strategy...")
 
             chunks = chunk_by_tokens(prompt)
 
             partials = []
-
             for chunk in chunks:
                 result = self._call_llm(chunk, system_message)
                 partials.append(result)
 
-                # ✅ throttle (VERY IMPORTANT)
-                time.sleep(0.5)
+                time.sleep(0.5)  # prevent rate limit
 
-            # 🔹 Reduce step
             final = self._call_llm(
                 "Combine and summarize:\n" + "\n".join(partials),
                 system_message,
@@ -223,13 +214,10 @@ class LLMClient:
 
             return final
 
-        # 🟢 Normal call
         return self._call_llm(prompt, system_message)
 
     def generate_json_message(self, prompt: str) -> str:
-        system_msg = (
-            "Return ONLY valid JSON. No explanation, no markdown, no extra text."
-        )
+        system_msg = "Return ONLY valid JSON. No explanation, no markdown."
         return self.generate_message(prompt, system_msg)
 
     def stream_message(self, prompt: str):
@@ -242,6 +230,42 @@ class LLMClient:
             return True
         except Exception:
             return False
+
+    # =========================
+    # 🔁 BACKWARD COMPATIBLE METHOD
+    # =========================
+    def create_completion(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
+        response_format: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+
+        system_message = None
+        user_prompt = ""
+
+        for msg in messages:
+            if msg["role"] == "system":
+                system_message = msg["content"]
+            elif msg["role"] == "user":
+                user_prompt = msg["content"]
+
+        if response_format and response_format.get("type") == "json_object":
+            system_message = (system_message or "") + (
+                "\nReturn ONLY valid JSON. No extra text."
+            )
+
+        content = self.generate_message(user_prompt, system_message)
+
+        return {
+            "content": content,
+            "model": getattr(self, "model", "unknown"),
+            "usage": {
+                "total_tokens": len(content.split()) + len(user_prompt.split())
+            },
+            "finish_reason": "stop",
+        }
 
 
 # =========================
