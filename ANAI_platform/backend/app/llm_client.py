@@ -1,17 +1,11 @@
 """
 LLM client module for AssessNex AI.
 
-Supports:
-- Azure OpenAI
-- Google Gemini
-- Grok
-- Groq
-
-Includes:
-- Retry with exponential backoff
-- Token-based chunking
-- Map-Reduce summarization
-- Backward compatible create_completion()
+Final version includes:
+- TPM-safe chunking
+- Progressive reduction
+- Smart retry (TPM-aware)
+- Backward compatibility
 """
 
 from typing import Dict, Any, Optional, List
@@ -29,9 +23,9 @@ logger = get_logger(__name__)
 
 
 # =========================
-# 🔁 RETRY DECORATOR
+# 🔁 SMART RETRY DECORATOR
 # =========================
-def retry_with_backoff(max_retries: int = 5, min_wait: float = 1, max_wait: float = 60):
+def retry_with_backoff(max_retries: int = 5):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -40,19 +34,26 @@ def retry_with_backoff(max_retries: int = 5, min_wait: float = 1, max_wait: floa
             for attempt in range(max_retries + 1):
                 try:
                     return func(*args, **kwargs)
+
                 except Exception as e:
-                    error_str = str(e)
+                    error_str = str(e).lower()
                     last_exception = e
 
-                    is_retryable = any(
-                        x in error_str.lower()
-                        for x in ["429", "rate", "tpm", "rpm", "500", "502", "503", "504"]
-                    )
+                    is_tpm_error = "tokens per minute" in error_str or "tpm" in error_str
+                    is_rate_limit = "429" in error_str or "rate limit" in error_str
+                    is_transient = any(code in error_str for code in ["500", "502", "503", "504"])
 
-                    if not is_retryable or attempt == max_retries:
+                    if not (is_tpm_error or is_rate_limit or is_transient) or attempt == max_retries:
                         raise
 
-                    wait_time = min(min_wait * (2 ** attempt), max_wait)
+                    # 🔥 Smart wait strategy
+                    if is_tpm_error:
+                        wait_time = 60  # full cooldown
+                    elif is_rate_limit:
+                        wait_time = min(5 * (2 ** attempt), 30)
+                    else:
+                        wait_time = min(2 * (2 ** attempt), 20)
+
                     jitter = random.uniform(0, wait_time * 0.1)
                     total_wait = wait_time + jitter
 
@@ -70,9 +71,9 @@ def retry_with_backoff(max_retries: int = 5, min_wait: float = 1, max_wait: floa
 
 
 # =========================
-# ✂️ TOKEN CHUNKING
+# ✂️ TOKEN CHUNKING (SAFE)
 # =========================
-def chunk_by_tokens(text: str, model: str = "gpt-4", max_tokens: int = 2000):
+def chunk_by_tokens(text: str, model: str = "gpt-4", max_tokens: int = 800):
     enc = tiktoken.encoding_for_model(model)
     tokens = enc.encode(text)
 
@@ -167,7 +168,7 @@ class LLMClient:
         )
 
     # =========================
-    # 💬 INTERNAL CALL
+    # 💬 CORE CALL
     # =========================
     @retry_with_backoff()
     def _call_llm(self, prompt: str, system_message: Optional[str] = None) -> str:
@@ -183,6 +184,29 @@ class LLMClient:
         return response.content if hasattr(response, "content") else str(response)
 
     # =========================
+    # 🔥 SAFE REDUCE
+    # =========================
+    def _safe_reduce(self, partials: List[str], system_message: Optional[str]) -> str:
+        while len(partials) > 1:
+            new_partials = []
+
+            for i in range(0, len(partials), 3):
+                batch = partials[i : i + 3]
+
+                combined = self._call_llm(
+                    "Combine and summarize:\n" + "\n".join(batch),
+                    system_message,
+                )
+
+                new_partials.append(combined)
+
+                time.sleep(1.5)
+
+            partials = new_partials
+
+        return partials[0]
+
+    # =========================
     # 🚀 PUBLIC METHODS
     # =========================
     def generate_message(
@@ -194,25 +218,20 @@ class LLMClient:
 
         approx_tokens = len(prompt.split())
 
-        # 🔴 Large input → chunking
-        if use_chunking and approx_tokens > 3000:
-            logger.info("Using chunking strategy...")
+        if use_chunking and approx_tokens > 2000:
+            logger.info("Using TPM-safe chunking...")
 
             chunks = chunk_by_tokens(prompt)
 
             partials = []
+
             for chunk in chunks:
                 result = self._call_llm(chunk, system_message)
                 partials.append(result)
 
-                time.sleep(0.5)  # prevent rate limit
+                time.sleep(1.5)
 
-            final = self._call_llm(
-                "Combine and summarize:\n" + "\n".join(partials),
-                system_message,
-            )
-
-            return final
+            return self._safe_reduce(partials, system_message)
 
         return self._call_llm(prompt, system_message)
 
@@ -232,7 +251,7 @@ class LLMClient:
             return False
 
     # =========================
-    # 🔁 BACKWARD COMPATIBLE METHOD
+    # 🔁 BACKWARD COMPATIBLE
     # =========================
     def create_completion(
         self,
@@ -252,9 +271,7 @@ class LLMClient:
                 user_prompt = msg["content"]
 
         if response_format and response_format.get("type") == "json_object":
-            system_message = (system_message or "") + (
-                "\nReturn ONLY valid JSON. No extra text."
-            )
+            system_message = (system_message or "") + "\nReturn ONLY valid JSON."
 
         content = self.generate_message(user_prompt, system_message)
 
